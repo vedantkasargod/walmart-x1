@@ -121,7 +121,7 @@ export default function WalmartHomepage() {
     startListening,
     stopListening,
     speak,
-    stopSpeaking,
+    cancelAll,
   } = useSpeech()
 
   // Helper function to get AI mode label
@@ -170,33 +170,100 @@ export default function WalmartHomepage() {
   const handleAIResponse = (message: string) => {
     if (!message.trim()) return
 
-    speak(message, () => {
-      // After speaking, automatically start listening for the next command
-      setTimeout(() => {
-        if (!isAILoading && !isLoading) {
-          startListening()
-        }
-      }, 500) // Small delay to ensure clean transition
+    speak(message, {
+      onEnd: () => {
+        console.log("AI has finished speaking. Activating microphone.")
+        startListening()
+      }
     })
   }
 
-  // Update search query when transcript changes
+  // The new, simpler version
+  const fetchReviewSession = async () => {
+    try {
+      const userId = "user123";
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/review_session/${userId}`);
+      if (!response.ok) {
+        throw new Error("Failed to fetch the review session.");
+      }
+      const reviewData = await response.json();
+      if (reviewData && Array.isArray(reviewData) && reviewData.length > 0) {
+        // --- The ONLY thing this function does now is set the state ---
+        setExtractedList(reviewData);
+      } else {
+        handleAIResponse("I couldn't generate a list for that request. Please try rephrasing.");
+      }
+    } catch (error: any) {
+      console.error("Error in fetchReviewSession:", error);
+      handleAIResponse(error.message || "There was a problem getting your list.");
+    }
+  };
+
+  // Helper to just fetch the review session list (no UI side effects)
+  const getReviewSessionFromServer = async () => {
+    try {
+      const userId = "user123";
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/review_session/${userId}`);
+      if (!response.ok) return [];
+      return await response.json();
+    } catch {
+      return [];
+    }
+  };
+
+  // State-aware voice command handler
+  const handleVoiceCommand = async (transcript: string) => {
+    if (!transcript.trim()) return;
+    if (showReviewModal) {
+      // User is in review modal, treat transcript as a list modification command
+      try {
+        const userId = "user123"; // This will be dynamic later
+        const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/modify_review_list/${userId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command: transcript }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || "Failed to modify review list.");
+        // Check for the special keyword from the backend
+        if (data.message === "CONFIRM_ADD") {
+          handleAIResponse("Okay, adding these items to your cart.");
+          await handleConfirmAndAdd();
+        } else {
+          // For other actions like 'remove' or 'update'
+          handleAIResponse(data.message); // Speak the confirmation (e.g., "Okay, I've removed that item.")
+          // Fetch the new state of the list from Redis to update the UI
+          const updatedList = await getReviewSessionFromServer();
+          setExtractedList(updatedList);
+        }
+      } catch (error: any) {
+        handleAIResponse(`Sorry, I couldn't process that command.`);
+      }
+    } else {
+      // Default: treat transcript as a new smart search query
+      setSmartSearchQuery(transcript);
+      await handleSmartSearch();
+    }
+  };
+
+  // This useEffect replaces the old one that just updated the search bar.
   useEffect(() => {
     if (transcript) {
-      setSmartSearchQuery(transcript)
+      // When a transcript is finalized, immediately process it as a command.
+      handleVoiceCommand(transcript);
     }
-  }, [transcript])
+  }, [transcript]);
 
-  // Show review modal when extracted list is populated
+  // New useEffect to handle speaking when extractedList is populated and modal is not open
   useEffect(() => {
-    if (extractedList.length > 0) {
-      setShowReviewModal(true)
-      // Speak when review modal opens
-      handleAIResponse(
-        "I've created a list for your review. Please make any changes and click 'Add to Cart' when ready.",
-      )
+    // This effect runs ONLY when the extractedList state changes.
+    if (extractedList.length > 0 && !showReviewModal) {
+      // We check for !showReviewModal to prevent this from re-firing on every minor list change.
+      // It only fires when the list is first created.
+      setShowReviewModal(true);
+      handleAIResponse(`I've created a list with ${extractedList.length} items for your review. Please tell me if you'd like to make any changes.`);
     }
-  }, [extractedList])
+  }, [extractedList]);
 
   // Load existing cart on component mount
   useEffect(() => {
@@ -221,11 +288,11 @@ export default function WalmartHomepage() {
 
   const handleMicrophoneClick = () => {
     if (isSpeaking) {
-      stopSpeaking()
+      cancelAll();
     } else if (isListening) {
-      stopListening()
+      stopListening();
     } else {
-      startListening()
+      startListening();
     }
   }
 
@@ -261,128 +328,77 @@ export default function WalmartHomepage() {
     })
   }
 
+  // Refactored handleSmartSearch for stateful backend
   const handleSmartSearch = async () => {
-    if (!smartSearchQuery.trim()) return
-
-    // Use a more generic loading state, as discussed
-    setIsAILoading(true) // Assuming you renamed setIsLoading to setIsAILoading
-    setApiError(null)
-
+    if (!smartSearchQuery.trim()) return;
+    setIsAILoading(true);
+    setApiError(null);
     try {
       const requestBody: ProcessQueryRequest = {
         query: smartSearchQuery,
         user_id: "user123",
         session_id: "session456",
         ai_mode: aiMode,
-      }
-
+      };
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/process_query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
-      })
-
-      const data = await response.json()
-
+      });
       if (!response.ok) {
-        // Use the 'detail' key from FastAPI's HTTPException for the error message
-        throw new Error(data.detail || "An unknown API error occurred.")
+        const data = await response.json();
+        throw new Error(data.detail || "An unknown API error occurred.");
       }
-
-      // --- START OF FIX ---
-      if (aiMode === "build_cart") {
-        // The backend now returns an object. We need to look inside `data.review_items`.
-        if (data.review_items && Array.isArray(data.review_items) && data.review_items.length > 0) {
-          // The normalization function is still a good idea.
-          console.log("Raw review items from API:", data.review_items)
-          const normalizedItems = data.review_items
-          setExtractedList(normalizedItems)
-          setSmartSearchQuery("")
-
-          toast.success("Cart built successfully!", {
-            description: `Found ${data.review_items.length} items for your review.`,
-            duration: 3000,
-          })
-
-          // Speak the AI response
-          if (data.message) {
-            handleAIResponse(data.message)
-          } else {
-            handleAIResponse(`I've built a cart with ${data.review_items.length} items for your review.`)
-          }
-        } else {
-          // This block now correctly handles the case where the AI found no relevant items.
-          const noItemsMessage =
-            data.message || "I couldn't find any items matching your request. Try being more specific."
-          toast.info("No items found", {
-            description: "Try refining your request or being more specific.",
-            duration: 3000,
-          })
-          handleAIResponse(noItemsMessage)
-        }
-        // --- END OF FIX ---
+      if (aiMode === "build_cart" || aiMode === "recommend") {
+        setSmartSearchQuery("");
+        await fetchReviewSession();
       } else if (aiMode === "add_to_cart") {
-        // This part is already correct and assumes `data` is the ProcessResponse object.
-        const smartSearchData = data as SmartSearchResponse
-
+        const data = await response.json();
+        const smartSearchData = data as SmartSearchResponse;
         if (smartSearchData.added_items && smartSearchData.added_items.length > 0) {
-          addItems(smartSearchData.added_items)
-
+          addItems(smartSearchData.added_items);
           smartSearchData.added_items.forEach((item) => {
-            showItemAddedToast(item)
-          })
-
-          setSmartSearchQuery("")
-
+            showItemAddedToast(item);
+          });
+          setSmartSearchQuery("");
           // Show summary toast
-          const totalItems = smartSearchData.added_items.reduce((sum, item) => sum + item.quantity, 0)
-          const totalValue = smartSearchData.added_items.reduce((sum, item) => sum + item.price * item.quantity, 0)
-
+          const totalItems = smartSearchData.added_items.reduce((sum, item) => sum + item.quantity, 0);
+          const totalValue = smartSearchData.added_items.reduce((sum, item) => sum + item.price * item.quantity, 0);
           setTimeout(() => {
             toast.info(`Smart Search Complete!`, {
               description: `Added ${totalItems} items worth $${totalValue.toFixed(2)} to your cart`,
               duration: 3000,
-            })
-          }, 500)
-
+            });
+          }, 500);
           // Speak the AI response
           if (smartSearchData.message) {
-            handleAIResponse(smartSearchData.message)
+            handleAIResponse(smartSearchData.message);
           } else {
-            handleAIResponse(`I've added ${totalItems} items to your cart for $${totalValue.toFixed(2)}.`)
+            handleAIResponse(`I've added ${totalItems} items to your cart for $${totalValue.toFixed(2)}.`);
           }
         } else {
           const noItemsMessage =
-            smartSearchData.message || "I couldn't find any items matching your search. Try refining your query."
+            smartSearchData.message || "I couldn't find any items matching your search. Try refining your query.";
           toast.info("No items found", {
             description: "Try refining your search query",
             duration: 3000,
-          })
-          handleAIResponse(noItemsMessage)
+          });
+          handleAIResponse(noItemsMessage);
         }
-      } else if (aiMode === "recommend") {
-        const recommendMessage = data.message || "Recommendation functionality is coming soon!"
-        toast.info("Recommend mode", {
-          description: "Recommendation functionality coming soon!",
-          duration: 3000,
-        })
-        handleAIResponse(recommendMessage)
       }
     } catch (error: any) {
-      console.error("Failed to fetch search results:", error)
-      const errorMessage = error.message
-      setApiError(errorMessage)
+      console.error("Failed to fetch search results:", error);
+      const errorMessage = error.message;
+      setApiError(errorMessage);
       toast.error("Search failed", {
         description: errorMessage,
         duration: 4000,
-      })
-
-      // Speak the error message
-      handleAIResponse(`Sorry, there was an error: ${errorMessage}`)
+      });
+      handleAIResponse(`Sorry, there was an error: ${errorMessage}`);
     } finally {
-      setIsAILoading(false) // Reset the generic loading state
+      setIsAILoading(false);
     }
-  }
+  };
 
   const handleUploadClick = () => {
     fileInputRef.current?.click()

@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 # --- Import all our Pydantic Models ---
-from app.models.api_models import QueryRequest, ProcessResponse, ExtractedProduct, BulkAddRequest
+from app.models.api_models import QueryRequest, ProcessResponse, ExtractedProduct, BulkAddRequest, ModifyReviewRequest
 
 # --- Import all our Service Functions ---
 from app.services.llm_service import get_ai_plan, extract_product_info_from_query, extract_items_from_text
@@ -17,6 +17,8 @@ from app.services.cart_service import add_item_to_temp_cart, remove_item_from_te
 from app.services.ocr_service import extract_text_from_pdf
 from app.services.order_service import create_order_from_cart, get_last_order_for_user
 from app.services.budget_service import curate_cart_with_llm
+from app.services.review_service import create_review_session, get_review_session, clear_review_session
+from app.services.llm_service import get_list_modification_action
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -29,7 +31,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# --- FastAPI Application Initialization ---
+
 app = FastAPI(
     title="Walmart Smart Cart API",
     description="Microservice with a Unified AI Planner for smart shopping.",
@@ -60,15 +62,14 @@ async def process_user_query(request: QueryRequest):
         
         plan = get_ai_plan(request.query)
         intent = plan.get("intent")
+        review_list = []
 
-        # --- Sub-Logic: Reorder based on past purchases ---
         if intent == 'reorder':
             print("AI Plan: Reorder the last cart.")
             last_order_items = get_last_order_for_user(request.user_id)
             if not last_order_items:
                 raise HTTPException(status_code=404, detail="You have no previous orders to rebuild from!")
             
-            review_list = []
             for item in last_order_items:
                 if item.get('products'):
                     original_product_data = item['products']
@@ -83,15 +84,12 @@ async def process_user_query(request: QueryRequest):
                             alt['source'] = 'Recommendation'
                             review_list.append(alt)
                             break
-            
-            return ProcessResponse(message=plan.get("query_for_user", "Rebuilt from your last order."), review_items=review_list)
-
-        # --- Sub-Logic: Create a new cart based on an event/theme ---
+        
         elif intent == 'create_event':
             print(f"AI Plan: Create an event-based cart. Themes: {plan.get('themes')}")
             themes = plan.get("themes", [])
             if not themes:
-                raise HTTPException(status_code=400, detail="The AI could not determine a theme from your request.")
+                raise HTTPException(status_code=400, detail="The AI could not determine a theme.")
             
             all_matched_products = {}
             for theme in themes:
@@ -101,22 +99,26 @@ async def process_user_query(request: QueryRequest):
             unique_product_list = list(all_matched_products.values())
             
             if not unique_product_list:
-                raise HTTPException(status_code=404, detail="I couldn't find any items matching those themes.")
+                raise HTTPException(status_code=404, detail="Could not find items matching themes.")
             
-            final_review_list = curate_cart_with_llm(
+            review_list = curate_cart_with_llm(
                 products=unique_product_list, 
                 budget=plan.get("budget"),
                 user_query=request.query
             )
-
-            if not final_review_list:
-                 raise HTTPException(status_code=404, detail="The AI curator could not create a cart for your request.")
-
-            return ProcessResponse(message="Here are some AI-curated suggestions for your event!", review_items=final_review_list)
         
-        else: # Handles AI planner failure
-            raise HTTPException(status_code=400, detail="The AI could not understand your request. Please try rephrasing.")
+        else:
+            raise HTTPException(status_code=400, detail="The AI could not understand your request.")
 
+        # --- New Behavior: Save the generated list to a review session ---
+        if review_list:
+            create_review_session(request.user_id, review_list)
+            return ProcessResponse(
+                message=plan.get("query_for_user", "A new list is ready for your review!"),
+            )
+        else:
+            raise HTTPException(status_code=404, detail="The AI could not generate a list for that request.")
+        
     # --- Handle standard "Add to Cart" mode ---
     elif request.ai_mode == 'add_to_cart':
         print("Handling 'Add to Cart' request...")
@@ -193,6 +195,63 @@ async def add_bulk_items(request: BulkAddRequest):
 @app.get("/temp_cart/{user_id}", response_model=List[dict])
 async def get_user_cart(user_id: str):
     return get_temp_cart(user_id)
+
+@app.get("/review_session/{user_id}", response_model=List[dict])
+async def get_user_review_session(user_id: str):
+    """Retrieves the review session list for a user from Redis."""
+    session_items = get_review_session(user_id)
+    if session_items is None:
+        return []
+    return session_items
+
+@app.post("/modify_review_list/{user_id}")
+async def modify_review_list(user_id: str, request: ModifyReviewRequest):
+    """
+    Takes a user's voice command, gets the AI action, modifies the review
+    session in Redis, and returns a confirmation message.
+    """
+    # 1. Get the current state of the review list from Redis
+    current_list = get_review_session(user_id)
+    if current_list is None:
+        raise HTTPException(status_code=404, detail="No active review session found to modify.")
+
+    # 2. Get the structured action from our "Action Taker" LLM
+    action_data = get_list_modification_action(request.command, current_list)
+    action_type = action_data.get("action")
+    
+    message = "I'm not sure how to do that. Please try again." # Default message
+
+    # 3. Execute the action
+    if action_type == "remove":
+        item_id_to_remove = action_data.get("item_id")
+        # Create a new list excluding the item to be removed
+        updated_list = [item for item in current_list if item.get("id") != item_id_to_remove]
+        create_review_session(user_id, updated_list) # Save the new list back to Redis
+        message = "Okay, I've removed that item."
+
+    elif action_type == "update_quantity":
+        item_id_to_update = action_data.get("item_id")
+        new_quantity = action_data.get("quantity")
+        
+        for item in current_list:
+            if item.get("id") == item_id_to_update:
+                item["quantity"] = new_quantity
+                break
+        create_review_session(user_id, current_list) # Save the modified list
+        message = "Got it. I've updated the quantity."
+
+    elif action_type == "confirm_add":
+        # This action tells the frontend to proceed with adding the items to the cart.
+        # We don't modify the list, just send a specific message.
+        message = "CONFIRM_ADD" # A special keyword the frontend will look for
+
+    elif action_type == "unknown":
+        message = "I didn't understand that command. Can you rephrase?"
+
+    # 4. Return a simple message for the AI to speak
+    # The frontend will then re-fetch the review session to update the UI.
+    return {"message": message}
+
 
 @app.delete("/temp_cart_item/{user_id}/{item_id}")
 async def reject_cart_item(user_id: str, item_id: str):

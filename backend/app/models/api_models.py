@@ -51,3 +51,9 @@ class BulkAddRequest(BaseModel):
     """
     user_id: str
     products: List[ExtractedProduct]
+
+class ModifyReviewRequest(BaseModel):
+    """
+    Defines the request body for sending a voice command to modify the review list.
+    """
+    command: str

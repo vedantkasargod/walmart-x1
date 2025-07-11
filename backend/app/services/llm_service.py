@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from app.models.api_models import LLMResponse
 from typing import List
 from app.models.api_models import LLMResponse
-
+from typing import Dict
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 load_dotenv()
@@ -29,6 +29,7 @@ def load_prompt(file_path: str) -> str:
 PROMPT_DIR = "D:\\walmart_4\\backend\\app\\prompts" # Use double backslashes for Windows paths
 EXTRACT_PRODUCTS_PROMPT = load_prompt(os.path.join(PROMPT_DIR, 'extract_products_prompt.md'))
 EXTRACT_LIST_ITEMS_PROMPT = load_prompt(os.path.join(PROMPT_DIR, 'extract_list_items_prompt.md'))
+LIST_MODIFICATION_PROMPT = load_prompt(os.path.join(PROMPT_DIR, 'list_modification_prompt.md'))
 # in llm_service.py
 # First, load the new prompt at the top
 UNIFIED_PLANNER_PROMPT = load_prompt(os.path.join(PROMPT_DIR, 'unified_planner_prompt.md'))
@@ -191,4 +192,49 @@ def extract_product_info_from_query(query: str) -> LLMResponse:
         raise HTTPException(status_code=500, detail="LLM response did not match the required data structure.")
     
 
+# in backend/app/services/llm_service.py
 
+def get_list_modification_action(user_command: str, current_list: List[Dict]) -> Dict:
+    """
+    Takes a user's voice command and the current review list, and determines
+    the specific action to perform on that list.
+    """
+    logging.info("Initiating LLM call for list modification action.")
+    
+    if not LIST_MODIFICATION_PROMPT:
+        return {"action": "error", "detail": "List modification prompt not loaded."}
+
+    # Format the context for the LLM
+    list_for_prompt = json.dumps(
+        [{"id": item.get("id"), "name": item.get("name"), "quantity": item.get("quantity")} for item in current_list],
+        indent=2
+    )
+    
+    prompt_context = (
+        f"CURRENT LIST:\n{list_for_prompt}\n\n"
+        f"USER COMMAND: \"{user_command}\"\n"
+    )
+    
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+    data = {
+        "model": "mistralai/mistral-7b-instruct:free",
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "system", "content": LIST_MODIFICATION_PROMPT}, {"role": "user", "content": prompt_context}],
+    }
+
+    try:
+        response = requests.post(OPENROUTER_API_URL, headers=headers, json=data, timeout=20)
+        response.raise_for_status()
+        llm_output = response.json()['choices'][0]['message']['content']
+        
+        # Robust JSON parsing
+        start_index = llm_output.find('{')
+        end_index = llm_output.rfind('}') + 1
+        json_str = llm_output[start_index:end_index]
+        parsed_action = json.loads(json_str)
+        
+        logging.info(f"LLM returned action: {parsed_action}")
+        return parsed_action
+    except Exception as e:
+        logging.error(f"Failed during list modification action extraction: {e}")
+        return {"action": "error", "detail": str(e)}
