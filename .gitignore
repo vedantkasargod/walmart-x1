@@ -1,0 +1,42 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.whl
+*.egg-info/
+*.log
+
+# Node
+node_modules/
+dist/
+build/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Images and binaries (optional, if not needed in repo)
+*.dll
+*.exe
+*.pyd
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# Environment
+.env
+.env.*
+
+# Next.js
+.next/
+out/
+
+# Lock files (optional)
+pnpm-lock.yaml
+package-lock.json
+yarn.lock 
