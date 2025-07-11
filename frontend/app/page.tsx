@@ -25,9 +25,10 @@ import {
   Check,
   ShoppingCart,
   Wand2,
+  Volume2,
 } from "lucide-react"
 import Image from "next/image"
-import { useSpeechToText } from "@/hooks/useSpeechToText"
+import { useSpeech } from "@/hooks/useSpeech"
 import { useCartStore } from "@/hooks/useCartStore"
 import { CartSidebar } from "@/components/cart-sidebar"
 import { QuantityControl } from "@/components/quantity-control"
@@ -35,8 +36,6 @@ import { toast } from "sonner"
 
 // Type definitions for AI modes
 type AIMode = "add_to_cart" | "build_cart" | "recommend"
-
-
 
 // Type definitions for API responses
 interface AddedItem {
@@ -55,17 +54,15 @@ interface SmartSearchResponse {
 
 // The corrected version
 interface ExtractedItem {
-  id?: number;              // <-- The crucial addition to fix the error
-  product_name?: string;
-  name?: string;
-  quantity: number;
-  estimated_price?: number;
-  
-  // It's also a good idea to add these other fields that come from your database search
-  description?: string;
-  price?: number;
-  image_url?: string;
-  source?: string; // Added for recommendation badge
+  id?: number // <-- The crucial addition to fix the error
+  product_name?: string
+  name?: string
+  quantity: number
+  estimated_price?: number // It's also a good idea to add these other fields that come from your database search
+  description?: string
+  price?: number
+  image_url?: string
+  source?: string
 }
 
 interface BulkAddRequest {
@@ -115,8 +112,17 @@ export default function WalmartHomepage() {
   // Cart store
   const { items, totalPrice, setCart, addItems, removeItem, clearCart } = useCartStore()
 
-  // Speech-to-text hook
-  const { isListening, transcript, hasRecognitionSupport, startListening, stopListening } = useSpeechToText()
+  // Speech hook (upgraded with TTS)
+  const {
+    isListening,
+    transcript,
+    hasRecognitionSupport,
+    isSpeaking,
+    startListening,
+    stopListening,
+    speak,
+    stopSpeaking,
+  } = useSpeech()
 
   // Helper function to get AI mode label
   const getAIModeLabel = (mode: AIMode): string => {
@@ -160,6 +166,20 @@ export default function WalmartHomepage() {
     }
   }
 
+  // Central conversational loop function
+  const handleAIResponse = (message: string) => {
+    if (!message.trim()) return
+
+    speak(message, () => {
+      // After speaking, automatically start listening for the next command
+      setTimeout(() => {
+        if (!isAILoading && !isLoading) {
+          startListening()
+        }
+      }, 500) // Small delay to ensure clean transition
+    })
+  }
+
   // Update search query when transcript changes
   useEffect(() => {
     if (transcript) {
@@ -171,6 +191,10 @@ export default function WalmartHomepage() {
   useEffect(() => {
     if (extractedList.length > 0) {
       setShowReviewModal(true)
+      // Speak when review modal opens
+      handleAIResponse(
+        "I've created a list for your review. Please make any changes and click 'Add to Cart' when ready.",
+      )
     }
   }, [extractedList])
 
@@ -196,7 +220,9 @@ export default function WalmartHomepage() {
   }, [setCart])
 
   const handleMicrophoneClick = () => {
-    if (isListening) {
+    if (isSpeaking) {
+      stopSpeaking()
+    } else if (isListening) {
       stopListening()
     } else {
       startListening()
@@ -236,93 +262,127 @@ export default function WalmartHomepage() {
   }
 
   const handleSmartSearch = async () => {
-    if (!smartSearchQuery.trim()) return;
+    if (!smartSearchQuery.trim()) return
 
     // Use a more generic loading state, as discussed
-    setIsAILoading(true); // Assuming you renamed setIsLoading to setIsAILoading
-    setApiError(null);
+    setIsAILoading(true) // Assuming you renamed setIsLoading to setIsAILoading
+    setApiError(null)
 
     try {
       const requestBody: ProcessQueryRequest = {
         query: smartSearchQuery,
         user_id: "user123",
         session_id: "session456",
-
         ai_mode: aiMode,
-      };
+      }
 
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/process_query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
-      });
+      })
 
-      const data = await response.json();
+      const data = await response.json()
 
       if (!response.ok) {
         // Use the 'detail' key from FastAPI's HTTPException for the error message
-        throw new Error(data.detail || "An unknown API error occurred.");
+        throw new Error(data.detail || "An unknown API error occurred.")
       }
 
       // --- START OF FIX ---
       if (aiMode === "build_cart") {
         // The backend now returns an object. We need to look inside `data.review_items`.
         if (data.review_items && Array.isArray(data.review_items) && data.review_items.length > 0) {
-          
           // The normalization function is still a good idea.
           console.log("Raw review items from API:", data.review_items)
-          const normalizedItems = data.review_items;
-          setExtractedList(normalizedItems);
-
-          setSmartSearchQuery("");
+          const normalizedItems = data.review_items
+          setExtractedList(normalizedItems)
+          setSmartSearchQuery("")
 
           toast.success("Cart built successfully!", {
             description: `Found ${data.review_items.length} items for your review.`,
             duration: 3000,
-          });
+          })
+
+          // Speak the AI response
+          if (data.message) {
+            handleAIResponse(data.message)
+          } else {
+            handleAIResponse(`I've built a cart with ${data.review_items.length} items for your review.`)
+          }
         } else {
           // This block now correctly handles the case where the AI found no relevant items.
+          const noItemsMessage =
+            data.message || "I couldn't find any items matching your request. Try being more specific."
           toast.info("No items found", {
             description: "Try refining your request or being more specific.",
             duration: 3000,
-          });
+          })
+          handleAIResponse(noItemsMessage)
         }
-      // --- END OF FIX ---
-      
+        // --- END OF FIX ---
       } else if (aiMode === "add_to_cart") {
         // This part is already correct and assumes `data` is the ProcessResponse object.
-        const smartSearchData = data as SmartSearchResponse;
+        const smartSearchData = data as SmartSearchResponse
+
         if (smartSearchData.added_items && smartSearchData.added_items.length > 0) {
-          addItems(smartSearchData.added_items);
+          addItems(smartSearchData.added_items)
+
           smartSearchData.added_items.forEach((item) => {
-            showItemAddedToast(item);
-          });
-          setSmartSearchQuery("");
-          // ... summary toast logic ...
+            showItemAddedToast(item)
+          })
+
+          setSmartSearchQuery("")
+
+          // Show summary toast
+          const totalItems = smartSearchData.added_items.reduce((sum, item) => sum + item.quantity, 0)
+          const totalValue = smartSearchData.added_items.reduce((sum, item) => sum + item.price * item.quantity, 0)
+
+          setTimeout(() => {
+            toast.info(`Smart Search Complete!`, {
+              description: `Added ${totalItems} items worth $${totalValue.toFixed(2)} to your cart`,
+              duration: 3000,
+            })
+          }, 500)
+
+          // Speak the AI response
+          if (smartSearchData.message) {
+            handleAIResponse(smartSearchData.message)
+          } else {
+            handleAIResponse(`I've added ${totalItems} items to your cart for $${totalValue.toFixed(2)}.`)
+          }
         } else {
+          const noItemsMessage =
+            smartSearchData.message || "I couldn't find any items matching your search. Try refining your query."
           toast.info("No items found", {
             description: "Try refining your search query",
             duration: 3000,
-          });
+          })
+          handleAIResponse(noItemsMessage)
         }
       } else if (aiMode === "recommend") {
+        const recommendMessage = data.message || "Recommendation functionality is coming soon!"
         toast.info("Recommend mode", {
           description: "Recommendation functionality coming soon!",
           duration: 3000,
-        });
+        })
+        handleAIResponse(recommendMessage)
       }
     } catch (error: any) {
-      console.error("Failed to fetch search results:", error);
-      const errorMessage = error.message;
-      setApiError(errorMessage);
+      console.error("Failed to fetch search results:", error)
+      const errorMessage = error.message
+      setApiError(errorMessage)
       toast.error("Search failed", {
         description: errorMessage,
         duration: 4000,
-      });
+      })
+
+      // Speak the error message
+      handleAIResponse(`Sorry, there was an error: ${errorMessage}`)
     } finally {
-      setIsAILoading(false); // Reset the generic loading state
+      setIsAILoading(false) // Reset the generic loading state
     }
-  };
+  }
 
   const handleUploadClick = () => {
     fileInputRef.current?.click()
@@ -358,11 +418,17 @@ export default function WalmartHomepage() {
           description: `Found ${data.length} items in your shopping list`,
           duration: 3000,
         })
+
+        // Speak success message for PDF upload
+        handleAIResponse(`I've successfully processed your PDF and found ${data.length} items in your shopping list.`)
       } else {
+        const noItemsMessage =
+          "I couldn't find any recognizable shopping items in your PDF. Please try a different file."
         toast.info("No items found", {
           description: "The PDF might not contain recognizable shopping items",
           duration: 4000,
         })
+        handleAIResponse(noItemsMessage)
       }
     } catch (error: any) {
       console.error("Failed to process PDF:", error)
@@ -372,6 +438,9 @@ export default function WalmartHomepage() {
         description: errorMessage,
         duration: 4000,
       })
+
+      // Speak error message for PDF upload
+      handleAIResponse(`Sorry, I couldn't process your PDF file: ${errorMessage}`)
     } finally {
       setIsAILoading(false)
       // Reset file input
@@ -404,20 +473,20 @@ export default function WalmartHomepage() {
 
     try {
       // --- START OF ROBUST FIX ---
-      const productsForBackend = extractedList.map(item => {
-          // This handles both potential naming conventions ('name' or 'product_name')
-          const productName = item.name || item.product_name || "Unknown Item";
-          
-          // This ensures quantity is always a number, defaulting to 1.
-          const productQuantity = typeof item.quantity === 'number' ? item.quantity : 1;
-  
-          return {
-              id: item.id,
-              name: productName,
-              quantity: productQuantity,
-              preferences: [] // Preferences are not relevant for this flow
-          };
-      });
+      const productsForBackend = extractedList.map((item) => {
+        // This handles both potential naming conventions ('name' or 'product_name')
+        const productName = item.name || item.product_name || "Unknown Item"
+
+        // This ensures quantity is always a number, defaulting to 1.
+        const productQuantity = typeof item.quantity === "number" ? item.quantity : 1
+
+        return {
+          id: item.id,
+          name: productName,
+          quantity: productQuantity,
+          preferences: [], // Preferences are not relevant for this flow
+        }
+      })
 
       const bulkAddRequest: BulkAddRequest = {
         user_id: "user123", // This will be dynamic later
@@ -434,7 +503,6 @@ export default function WalmartHomepage() {
 
       const data: BulkAddResponse = await response.json()
       console.log("Response from /add_bulk_items", data)
-
 
       if (!response.ok) {
         throw new Error(data.message || data.message || "Failed to add items to cart")
@@ -463,18 +531,28 @@ export default function WalmartHomepage() {
         // Close modal and clear state
         setShowReviewModal(false)
         setExtractedList([])
-      }else{
-        console.warn("API call was successful, but no items were added.");
-        toast.info("No new items were added to the cart.");
-        setShowReviewModal(false);
-        setExtractedList([]);
+
+        // Speak confirmation message
+        if (data.message) {
+          handleAIResponse(data.message)
+        } else {
+          handleAIResponse(`Perfect! I've added ${totalItems} items worth $${totalValue.toFixed(2)} to your cart.`)
+        }
+      } else {
+        console.warn("API call was successful, but no items were added.")
+        toast.info("No new items were added to the cart.")
+        setShowReviewModal(false)
+        setExtractedList([])
+        handleAIResponse("No new items were added to your cart.")
       }
     } catch (error: any) {
       console.error("Failed to add bulk items:", error)
+      const errorMessage = error.message || "Please try again later"
       toast.error("Failed to add items", {
-        description: error.message || "Please try again later",
+        description: errorMessage,
         duration: 4000,
       })
+      handleAIResponse(`Sorry, I couldn't add the items to your cart: ${errorMessage}`)
     } finally {
       setIsAddingToCart(false)
     }
@@ -484,6 +562,7 @@ export default function WalmartHomepage() {
     setShowReviewModal(false)
     setExtractedList([])
     setListError(null)
+    handleAIResponse("Okay, I've cancelled the review. What would you like to do next?")
   }
 
   const handleCheckout = () => {
@@ -524,6 +603,11 @@ export default function WalmartHomepage() {
           duration: 5000,
         })
 
+        // Speak success message
+        handleAIResponse(
+          `Excellent! Your order has been placed successfully. Your order ID is ${data.order_id}. Your items are on their way!`,
+        )
+
         // Close modal after showing success message
         setTimeout(() => {
           setIsPaymentModalOpen(false)
@@ -532,10 +616,12 @@ export default function WalmartHomepage() {
       } catch (error: any) {
         console.error("Checkout failed:", error)
         setPaymentStatus("idle")
+        const errorMessage = error.message || "Please try again later"
         toast.error("Checkout failed", {
-          description: error.message || "Please try again later",
+          description: errorMessage,
           duration: 4000,
         })
+        handleAIResponse(`Sorry, there was an issue with your checkout: ${errorMessage}`)
       }
     }, 2000)
   }
@@ -713,21 +799,29 @@ export default function WalmartHomepage() {
               />
             </div>
 
-            {/* Microphone Button */}
+            {/* Enhanced Microphone Button with Speaking Indicator */}
             {hasRecognitionSupport && (
               <Button
-                variant={isListening ? "default" : "outline"}
+                variant={isListening || isSpeaking ? "default" : "outline"}
                 size="icon"
                 onClick={handleMicrophoneClick}
                 className={`p-3 ${
                   isListening
                     ? "bg-red-600 hover:bg-red-700 text-white animate-pulse"
-                    : "border-gray-300 hover:border-gray-400"
+                    : isSpeaking
+                      ? "bg-green-600 hover:bg-green-700 text-white animate-pulse"
+                      : "border-gray-300 hover:border-gray-400"
                 }`}
-                title={isListening ? "Stop listening" : "Start voice input"}
+                title={
+                  isSpeaking
+                    ? "AI is speaking - click to stop"
+                    : isListening
+                      ? "Listening - click to stop"
+                      : "Start voice input"
+                }
                 disabled={isLoading || isAILoading}
               >
-                <Mic className="w-5 h-5" />
+                {isSpeaking ? <Volume2 className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
               </Button>
             )}
 
@@ -785,7 +879,7 @@ export default function WalmartHomepage() {
                 <div className="flex-1 flex items-center gap-4">
                   {item.image_url && (
                     <Image
-                      src={item.image_url}
+                      src={item.image_url || "/placeholder.svg"}
                       alt={item.name || "Product image"}
                       width={64}
                       height={64}
@@ -795,23 +889,23 @@ export default function WalmartHomepage() {
                   <div>
                     <div className="flex items-center gap-2">
                       <h3 className="font-medium text-lg capitalize">{item.name}</h3>
-                      {item.source === 'Recommendation' && (
-                        <span className="ml-2 px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded-full font-semibold">Recommendation</span>
+                      {item.source === "Recommendation" && (
+                        <span className="ml-2 px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded-full font-semibold">
+                          Recommendation
+                        </span>
                       )}
                     </div>
-                    {item.price !== undefined && (
-                      <p className="text-sm text-gray-600">${item.price.toFixed(2)}</p>
-                    )}
-                    {item.description && (
-                      <p className="text-xs text-gray-500 mt-1">{item.description}</p>
-                    )}
+                    {item.price !== undefined && <p className="text-sm text-gray-600">${item.price.toFixed(2)}</p>}
+                    {item.description && <p className="text-xs text-gray-500 mt-1">{item.description}</p>}
                   </div>
                 </div>
+
                 <div className="flex items-center space-x-4">
                   <QuantityControl
                     quantity={item.quantity}
                     onQuantityChange={(newQuantity) => handleQuantityChange(index, newQuantity)}
                   />
+
                   <Button
                     variant="ghost"
                     size="sm"
