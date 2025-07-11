@@ -1,6 +1,6 @@
 // file: hooks/useSpeech.tsx (Final, Bulletproof Version)
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from 'react';
 
 // Explicit interface for SpeechRecognition
 interface SpeechRecognition extends EventTarget {
@@ -29,85 +29,124 @@ interface SpeechRecognitionErrorEvent extends Event {
   message: string;
 }
 
-const SpeechRecognitionAPI: SpeechRecognitionConstructor | null =
-  typeof window !== "undefined" && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition) || null;
+type SpeechState = 'idle' | 'speaking' | 'listening';
 
-export const useSpeech = () => {
-  const [isListening, setIsListening] = useState(false);
-  const [transcript, setTranscript] = useState("");
-  const [hasRecognitionSupport, setHasRecognitionSupport] = useState(!!SpeechRecognitionAPI);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+interface SpeechHook {
+  speechState: SpeechState;
+  transcript: string;
+  speak: (text: string, options?: { onEnd?: () => void }) => void;
+  startListening: () => void;
+  stopListening: () => void;
+  cancelAll: () => void;
+  hasRecognitionSupport: boolean;
+}
+
+const SpeechRecognitionAPI: SpeechRecognitionConstructor | null =
+  (typeof window !== 'undefined' && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition)) || null;
+
+export const useSpeech = (): SpeechHook => {
+  const [speechState, setSpeechState] = useState<SpeechState>('idle');
+  const [transcript, setTranscript] = useState('');
+  
   const recognitionRef = useRef<SpeechRecognition | null>(null);
+  // --- NEW: A ref to hold the Audio object ---
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const cancelAll = useCallback(() => {
-    if (typeof window !== "undefined") window.speechSynthesis.cancel();
+    // Stop any browser TTS that might be running
+    if (typeof window !== 'undefined') window.speechSynthesis.cancel();
+    
+    // Stop any audio element that might be playing
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = ''; // Detach the audio source
+      audioRef.current = null;
+    }
+
+    // Stop any listening
     if (recognitionRef.current) recognitionRef.current.abort();
-    setIsListening(false);
-    setIsSpeaking(false);
+    
+    setSpeechState('idle');
   }, []);
 
-  // Updated speak function to accept options object with onEnd
-  const speak = useCallback((text: string, { onEnd }: { onEnd?: () => void } = {}) => {
-    if (!window.speechSynthesis || !text) {
-      if (onEnd) onEnd();
-      return;
-    }
-    cancelAll();
-    const utterance = new window.SpeechSynthesisUtterance(text);
-    setIsSpeaking(true);
-    utterance.onend = () => {
-      setIsSpeaking(false);
-      if (onEnd) onEnd();
+  // --- THIS IS THE UPDATED 'speak' FUNCTION ---
+  const speak = useCallback((text: string, options?: { onEnd?: () => void }) => {
+    if (!text) return;
+    
+    cancelAll(); // Stop anything currently happening
+
+    setSpeechState('speaking');
+
+    // Create a new Audio object
+    const newAudio = new Audio();
+    audioRef.current = newAudio;
+
+    // Construct the URL for our new backend TTS endpoint
+    const url = `${process.env.NEXT_PUBLIC_API_URL}/speak?text=${encodeURIComponent(text)}`;
+    newAudio.src = url;
+
+    // When the audio has finished playing, clean up and call the onEnd callback
+    newAudio.onended = () => {
+      setSpeechState('idle');
+      if (options && options.onEnd) options.onEnd();
     };
-    utterance.onerror = (event) => {
-      // @ts-ignore
-      console.error("Speech synthesis error:", event.error);
-      setIsSpeaking(false);
-      if (onEnd) onEnd();
+
+    newAudio.onerror = (e) => {
+      console.error("Audio playback error:", e);
+      setSpeechState('idle');
+      if (options && options.onEnd) options.onEnd();
     };
-    window.speechSynthesis.speak(utterance);
+
+    // Start playing the audio stream from our backend
+    newAudio.play();
+
   }, [cancelAll]);
+  // --- END OF UPDATED 'speak' FUNCTION ---
 
   const startListening = useCallback(() => {
-    if (!recognitionRef.current || isSpeaking) return;
+    if (speechState !== 'idle' || !recognitionRef.current) return;
     cancelAll();
-    setTranscript("");
-    setIsListening(true);
-    recognitionRef.current.start();
-  }, [isSpeaking, cancelAll]);
-
+    setSpeechState('listening');
+    setTranscript('');
+    try {
+      recognitionRef.current.start();
+    } catch (e) {
+      // Catch the "already started" error, just in case.
+      console.error("Could not start listening:", e);
+      setSpeechState('idle');
+    }
+  }, [speechState, cancelAll]);
+  
   const stopListening = useCallback(() => {
     if (!recognitionRef.current) return;
     recognitionRef.current.stop();
-    setIsListening(false);
-  }, []);
+    setSpeechState('idle');
+  }, [speechState]);
 
   useEffect(() => {
     if (!SpeechRecognitionAPI) {
-      setHasRecognitionSupport(false);
       return;
     }
-    setHasRecognitionSupport(true);
     const recognition = new SpeechRecognitionAPI();
     recognition.continuous = false;
     recognition.interimResults = false;
-    recognition.lang = "en-US";
+    recognition.lang = 'en-US';
 
     recognition.onresult = (event) => {
       const result = event.results[event.results.length - 1][0].transcript.trim();
       setTranscript(result);
-      setIsListening(false);
+      setSpeechState('idle');
     };
 
     recognition.onend = () => {
-      setIsListening(false);
+      setSpeechState('idle');
     };
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      if (event.error !== "no-speech" && event.error !== "aborted") {
-        console.error("Speech recognition error:", event.error);
+      if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        console.error('Speech recognition error:', event.error);
       }
-      setIsListening(false);
+      setSpeechState('idle');
     };
 
     recognitionRef.current = recognition;
@@ -118,13 +157,12 @@ export const useSpeech = () => {
   }, [cancelAll]);
 
   return {
-    isListening,
+    speechState,
     transcript,
-    hasRecognitionSupport,
-    isSpeaking,
+    speak,
     startListening,
     stopListening,
-    speak,
     cancelAll,
+    hasRecognitionSupport: !!SpeechRecognitionAPI,
   };
 };

@@ -19,6 +19,8 @@ from app.services.order_service import create_order_from_cart, get_last_order_fo
 from app.services.budget_service import curate_cart_with_llm
 from app.services.review_service import create_review_session, get_review_session, clear_review_session
 from app.services.llm_service import get_list_modification_action
+from app.services.voice_service import text_to_speech_stream
+from fastapi.responses import StreamingResponse
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -144,6 +146,26 @@ async def process_user_query(request: QueryRequest):
 
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported AI mode: {request.ai_mode}")
+    
+@app.get("/speak")
+async def speak_text(text: str):
+    """
+    Receives text, generates speech using ElevenLabs, and streams the
+    audio back to the client by handling the generator directly.
+    """
+    try:
+        audio_generator = text_to_speech_stream(text)
+        
+        # --- THE FIX ---
+        # Create a generator function to yield the audio chunks for StreamingResponse
+        async def stream_audio():
+            for chunk in audio_generator:
+                yield chunk
+        # --- END OF FIX ---
+
+        return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate speech: {str(e)}")
 
 # ===============================================
 # === PDF and Bulk Add Endpoints ===
