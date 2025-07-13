@@ -1,33 +1,6 @@
-// file: hooks/useSpeech.tsx (Final, Bulletproof Version)
+// file: hooks/useSpeech.tsx (Final HTTP Auto-Stop Voice Agent)
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-
-// Explicit interface for SpeechRecognition
-interface SpeechRecognition extends EventTarget {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => any) | null;
-  onend: ((this: SpeechRecognition, ev: Event) => any) | null;
-  onerror: ((this: SpeechRecognition, ev: SpeechRecognitionErrorEvent) => any) | null;
-  start(): void;
-  stop(): void;
-  abort(): void;
-}
-
-interface SpeechRecognitionConstructor {
-  new (): SpeechRecognition;
-}
-
-interface SpeechRecognitionEvent extends Event {
-  results: SpeechRecognitionResultList;
-  resultIndex: number;
-}
-
-interface SpeechRecognitionErrorEvent extends Event {
-  error: string;
-  message: string;
-}
+import { useState, useRef, useCallback, useEffect } from 'react';
 
 type SpeechState = 'idle' | 'speaking' | 'listening';
 
@@ -41,120 +14,160 @@ interface SpeechHook {
   hasRecognitionSupport: boolean;
 }
 
-const SpeechRecognitionAPI: SpeechRecognitionConstructor | null =
-  (typeof window !== 'undefined' && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition)) || null;
-
 export const useSpeech = (): SpeechHook => {
   const [speechState, setSpeechState] = useState<SpeechState>('idle');
   const [transcript, setTranscript] = useState('');
-  
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
-  // --- NEW: A ref to hold the Audio object ---
-  const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  const cancelAll = useCallback(() => {
-    // Stop any browser TTS that might be running
-    if (typeof window !== 'undefined') window.speechSynthesis.cancel();
-    
-    // Stop any audio element that might be playing
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+
+  // Check for MediaRecorder support
+  const [hasRecognitionSupport] = useState(
+    typeof window !== 'undefined' &&
+    !!navigator.mediaDevices &&
+    !!window.MediaRecorder
+  );
+
+  const stopAll = useCallback(() => {
+    // Stop any speaking
     if (audioRef.current) {
       audioRef.current.pause();
-      audioRef.current.src = ''; // Detach the audio source
+      audioRef.current.src = '';
       audioRef.current = null;
     }
-
     // Stop any listening
-    if (recognitionRef.current) recognitionRef.current.abort();
-    
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current = null;
+    }
+    // Release the microphone
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(track => track.stop());
+      audioStreamRef.current = null;
+    }
+    // Clear silence timer
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     setSpeechState('idle');
   }, []);
 
-  // --- THIS IS THE UPDATED 'speak' FUNCTION ---
   const speak = useCallback((text: string, options?: { onEnd?: () => void }) => {
     if (!text) return;
-    
-    cancelAll(); // Stop anything currently happening
-
+    stopAll();
     setSpeechState('speaking');
-
-    // Create a new Audio object
     const newAudio = new Audio();
-    audioRef.current = newAudio;
-
-    // Construct the URL for our new backend TTS endpoint
-    const url = `${process.env.NEXT_PUBLIC_API_URL}/speak?text=${encodeURIComponent(text)}`;
-    newAudio.src = url;
-
-    // When the audio has finished playing, clean up and call the onEnd callback
+    newAudio.src = `${process.env.NEXT_PUBLIC_API_URL}/speak?text=${encodeURIComponent(text)}`;
     newAudio.onended = () => {
       setSpeechState('idle');
       if (options && options.onEnd) options.onEnd();
     };
-
-    newAudio.onerror = (e) => {
-      console.error("Audio playback error:", e);
+    newAudio.onerror = () => {
+      console.error("Audio playback error.");
       setSpeechState('idle');
       if (options && options.onEnd) options.onEnd();
     };
-
-    // Start playing the audio stream from our backend
     newAudio.play();
+    audioRef.current = newAudio;
+  }, [stopAll]);
 
-  }, [cancelAll]);
-  // --- END OF UPDATED 'speak' FUNCTION ---
-
-  const startListening = useCallback(() => {
-    if (speechState !== 'idle' || !recognitionRef.current) return;
-    cancelAll();
-    setSpeechState('listening');
+  // --- Final HTTP Auto-Stop Voice Agent ---
+  const startListening = useCallback(async () => {
+    if (speechState !== 'idle') return;
+    stopAll();
     setTranscript('');
+    chunksRef.current = [];
+
     try {
-      recognitionRef.current.start();
-    } catch (e) {
-      // Catch the "already started" error, just in case.
-      console.error("Could not start listening:", e);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 16000
+        }
+      });
+      audioStreamRef.current = stream;
+
+      const recorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus',
+        audioBitsPerSecond: 16000
+      });
+      mediaRecorderRef.current = recorder;
+
+      // Silence auto-stop logic
+      const resetSilenceTimer = () => {
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = setTimeout(() => {
+          stopListening();
+        }, 1500); // 1.5 seconds of silence
+      };
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+          resetSilenceTimer();
+        }
+      };
+
+      recorder.onstop = async () => {
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = null;
+        }
+        if (audioStreamRef.current) {
+          audioStreamRef.current.getTracks().forEach(track => track.stop());
+          audioStreamRef.current = null;
+        }
+        setSpeechState('idle');
+        // Combine chunks and send to backend
+        const audioBlob = new Blob(chunksRef.current, { type: recorder.mimeType });
+        const formData = new FormData();
+        formData.append('audio', audioBlob, 'user_audio.webm');
+        try {
+          const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+          const response = await fetch(`${apiUrl}/transcribe_audio`, {
+            method: 'POST',
+            body: formData
+          });
+          if (!response.ok) throw new Error('Transcription failed');
+          const data = await response.json();
+          if (data.transcript) setTranscript(data.transcript);
+        } catch (err) {
+          console.error('Transcription error:', err);
+        }
+      };
+
+      recorder.start(250); // 250ms chunks
+      setSpeechState('listening');
+      resetSilenceTimer();
+    } catch (error) {
+      console.error('Failed to start listening:', error);
       setSpeechState('idle');
     }
-  }, [speechState, cancelAll]);
-  
+  }, [speechState, stopAll]);
+
   const stopListening = useCallback(() => {
-    if (!recognitionRef.current) return;
-    recognitionRef.current.stop();
-    setSpeechState('idle');
-  }, [speechState]);
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  }, []);
+
+  const cancelAll = useCallback(() => {
+    stopAll();
+  }, [stopAll]);
 
   useEffect(() => {
-    if (!SpeechRecognitionAPI) {
-      return;
-    }
-    const recognition = new SpeechRecognitionAPI();
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.lang = 'en-US';
-
-    recognition.onresult = (event) => {
-      const result = event.results[event.results.length - 1][0].transcript.trim();
-      setTranscript(result);
-      setSpeechState('idle');
-    };
-
-    recognition.onend = () => {
-      setSpeechState('idle');
-    };
-
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      if (event.error !== 'no-speech' && event.error !== 'aborted') {
-        console.error('Speech recognition error:', event.error);
-      }
-      setSpeechState('idle');
-    };
-
-    recognitionRef.current = recognition;
-
-    return () => {
-      cancelAll();
-    };
-  }, [cancelAll]);
+    return () => stopAll();
+  }, [stopAll]);
 
   return {
     speechState,
@@ -163,6 +176,6 @@ export const useSpeech = (): SpeechHook => {
     startListening,
     stopListening,
     cancelAll,
-    hasRecognitionSupport: !!SpeechRecognitionAPI,
+    hasRecognitionSupport,
   };
 };

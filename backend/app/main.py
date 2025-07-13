@@ -1,11 +1,15 @@
 import os
 import logging
 from typing import List, Optional
+import json
+
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from fastapi import WebSocket, WebSocketDisconnect
+from app.services.voice_service import speech_to_text_http
 
 # --- Import all our Pydantic Models ---
 from app.models.api_models import QueryRequest, ProcessResponse, ExtractedProduct, BulkAddRequest, ModifyReviewRequest
@@ -166,6 +170,15 @@ async def speak_text(text: str):
         return StreamingResponse(stream_audio(), media_type="audio/mpeg")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate speech: {str(e)}")
+
+@app.post("/transcribe_audio")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """
+    Receives an audio file from the frontend and returns the transcription.
+    """
+    audio_bytes = await audio.read()
+    transcript = speech_to_text_http(audio_bytes)
+    return {"transcript": transcript}
 
 # ===============================================
 # === PDF and Bulk Add Endpoints ===

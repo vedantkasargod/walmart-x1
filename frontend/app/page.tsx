@@ -28,7 +28,7 @@ import {
   Volume2,
 } from "lucide-react"
 import Image from "next/image"
-import { useSpeech } from "@/hooks/useSpeech"
+import dynamic from 'next/dynamic';
 import { useCartStore } from "@/hooks/useCartStore"
 import { CartSidebar } from "@/components/cart-sidebar"
 import { QuantityControl } from "@/components/quantity-control"
@@ -112,17 +112,10 @@ export default function WalmartHomepage() {
   // Cart store
   const { items, totalPrice, setCart, addItems, removeItem, clearCart } = useCartStore()
 
-  // Speech hook (upgraded with TTS)
-  const {
-    isListening,
-    transcript,
-    hasRecognitionSupport,
-    isSpeaking,
-    startListening,
-    stopListening,
-    speak,
-    cancelAll,
-  } = useSpeech()
+  const VoiceController = dynamic(
+    () => import('@/app/voiceController'),
+    { ssr: false }
+  );
 
   // Helper function to get AI mode label
   const getAIModeLabel = (mode: AIMode): string => {
@@ -168,14 +161,8 @@ export default function WalmartHomepage() {
 
   // Central conversational loop function
   const handleAIResponse = (message: string) => {
-    if (!message.trim()) return
-
-    speak(message, {
-      onEnd: () => {
-        console.log("AI has finished speaking. Activating microphone.")
-        startListening()
-      }
-    })
+    if (!message.trim()) return;
+    // The speak function is now handled by VoiceController
   }
 
   // The new, simpler version
@@ -215,29 +202,32 @@ export default function WalmartHomepage() {
   const handleVoiceCommand = async (transcript: string) => {
     if (!transcript.trim()) return;
     if (showReviewModal) {
-      // User is in review modal, treat transcript as a list modification command
+      // New logic for the 'if (showReviewModal)' block
+      setIsAILoading(true);
       try {
-        const userId = "user123"; // This will be dynamic later
-        const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/modify_review_list/${userId}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
+        // 1. Send the modification command to the backend
+        const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/modify_review_list/user123`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ command: transcript }),
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(data.message || "Failed to modify review list.");
-        // Check for the special keyword from the backend
+        if (!response.ok) {
+          throw new Error(data.detail || "Failed to modify the list.");
+        }
+        // 2. Check for the special 'confirm' action
         if (data.message === "CONFIRM_ADD") {
-          handleAIResponse("Okay, adding these items to your cart.");
           await handleConfirmAndAdd();
+          // No need to speak here, handleConfirmAndAdd will show toasts
         } else {
-          // For other actions like 'remove' or 'update'
-          handleAIResponse(data.message); // Speak the confirmation (e.g., "Okay, I've removed that item.")
-          // Fetch the new state of the list from Redis to update the UI
-          const updatedList = await getReviewSessionFromServer();
-          setExtractedList(updatedList);
+          // 3. For any other action, speak the confirmation and RE-FETCH the list
+          handleAIResponse(data.message); // This will speak and then start listening again
+          await fetchReviewSession(); // This is the crucial missing step to update the UI
         }
       } catch (error: any) {
-        handleAIResponse(`Sorry, I couldn't process that command.`);
+        handleAIResponse(error.message || "Something went wrong.");
+      } finally {
+        setIsAILoading(false);
       }
     } else {
       // Default: treat transcript as a new smart search query
@@ -245,14 +235,6 @@ export default function WalmartHomepage() {
       await handleSmartSearch();
     }
   };
-
-  // This useEffect replaces the old one that just updated the search bar.
-  useEffect(() => {
-    if (transcript) {
-      // When a transcript is finalized, immediately process it as a command.
-      handleVoiceCommand(transcript);
-    }
-  }, [transcript]);
 
   // New useEffect to handle speaking when extractedList is populated and modal is not open
   useEffect(() => {
@@ -285,16 +267,6 @@ export default function WalmartHomepage() {
 
     loadExistingCart()
   }, [setCart])
-
-  const handleMicrophoneClick = () => {
-    if (isSpeaking) {
-      cancelAll();
-    } else if (isListening) {
-      stopListening();
-    } else {
-      startListening();
-    }
-  }
 
   const handleUndo = async (itemId: string) => {
     // Optimistic update - remove from store immediately
@@ -815,31 +787,7 @@ export default function WalmartHomepage() {
               />
             </div>
 
-            {/* Enhanced Microphone Button with Speaking Indicator */}
-            {hasRecognitionSupport && (
-              <Button
-                variant={isListening || isSpeaking ? "default" : "outline"}
-                size="icon"
-                onClick={handleMicrophoneClick}
-                className={`p-3 ${
-                  isListening
-                    ? "bg-red-600 hover:bg-red-700 text-white animate-pulse"
-                    : isSpeaking
-                      ? "bg-green-600 hover:bg-green-700 text-white animate-pulse"
-                      : "border-gray-300 hover:border-gray-400"
-                }`}
-                title={
-                  isSpeaking
-                    ? "AI is speaking - click to stop"
-                    : isListening
-                      ? "Listening - click to stop"
-                      : "Start voice input"
-                }
-                disabled={isLoading || isAILoading}
-              >
-                {isSpeaking ? <Volume2 className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-              </Button>
-            )}
+            <VoiceController handleVoiceCommand={handleVoiceCommand} />
 
             {/* Upload List Button */}
             <Button

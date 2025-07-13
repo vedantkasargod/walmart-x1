@@ -5,3 +5,6 @@ requests
 python-dotenv
 supabase
 sentence-transformers
+websockets>=10.0
+elevenlabs
+websocket-client
